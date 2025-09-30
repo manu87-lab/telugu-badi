@@ -1,4 +1,16 @@
 import React, { useEffect, useState, useRef } from "react";
+// Optional cloud sync helpers (lazy, tolerant)
+// Helpers to lazily load cloud-sync at runtime (optional)
+async function lazyCloud() {
+  try {
+    // dynamic import — will fail if src/cloud-config.ts is missing or firebase not configured
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const cs = await import('./cloud-sync');
+    return { uploadEncryptedBlob: cs.uploadEncryptedBlob, fetchEncryptedBlob: cs.fetchEncryptedBlob, signIn: cs.signIn, signOut: cs.signOut, onAuthChanged: cs.onAuthChanged };
+  } catch (e) {
+    return { uploadEncryptedBlob: null, fetchEncryptedBlob: null, signIn: null, signOut: null, onAuthChanged: null };
+  }
+}
 
 // ---- Types ----
 type PhotoSet = { student?: string; father?: string; mother?: string; guardian1?: string; guardian2?: string };
@@ -279,6 +291,31 @@ function calculateAge(dateOfBirth) {
   return age;
 }
 
+// Merge two AppDB objects: union students (by id, prefer local), union logs (dedupe by id, keep newest)
+function mergeDatabases(localDb: AppDB, remoteDb: AppDB): AppDB {
+  const studentsMap: Record<string, Student> = {};
+  for (const r of (remoteDb.students || [])) studentsMap[r.id] = r;
+  for (const l of (localDb.students || [])) studentsMap[l.id] = l; // local wins
+  const mergedStudents = Object.values(studentsMap);
+
+  const logMap: Record<string, any> = {};
+  const allLogs = [...(remoteDb.logs || []), ...(localDb.logs || [])];
+  for (const lg of allLogs) {
+    if (!lg || !lg.id) continue;
+    if (!logMap[lg.id]) logMap[lg.id] = lg;
+    else {
+      // keep the one with later timestamp if available
+      try {
+        const a = new Date(logMap[lg.id].timestamp || 0).getTime();
+        const b = new Date(lg.timestamp || 0).getTime();
+        if (b > a) logMap[lg.id] = lg;
+      } catch (e) { /* ignore */ }
+    }
+  }
+  const mergedLogs = Object.values(logMap).sort((a: any, b: any) => (new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
+  return { students: mergedStudents, logs: mergedLogs };
+}
+
 // Compress image file via canvas -> JPEG (reduces size dramatically)
 function fileToDataUrl(file: File | null, maxDim = 900, quality = 0.75) {
   return new Promise<string | null>((res, rej) => {
@@ -319,6 +356,10 @@ export default function App() {
   const [passphrase, setPassphrase] = useState<string>("");
   const [db, setDb] = useState<AppDB>({ students: [], logs: [] });
   const [unlocked, setUnlocked] = useState<boolean>(false);
+  const [authUser, setAuthUser] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<string | null>(null);
+  const [lastSyncAt, setLastSyncAt] = useState<string | null>(null);
+  const [remember, setRemember] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(false);
   const [view, setView] = useState<string>("checkin"); // checkin | checkout | admin
 
@@ -347,17 +388,171 @@ export default function App() {
   const [checkoutClass, setCheckoutClassState] = useState(classOptions[0]);
   const [checkoutQuery, setCheckoutQuery] = useState("");
 
+  // Centralized uploader: uploads current encrypted DB and updates UI state
+  async function uploadCurrentEncryptedDB() {
+    try {
+      setSyncStatus('Syncing...');
+      const cs = await lazyCloud();
+      if (!cs || !cs.uploadEncryptedBlob) {
+        setSyncStatus('No cloud');
+        return false;
+      }
+      const encStr = await idbGet(STORAGE_KEY);
+      if (!encStr) { setSyncStatus('No data'); return false; }
+      const ok = await cs.uploadEncryptedBlob(passphrase, String(encStr));
+      if (ok) {
+        setSyncStatus('Synced');
+        setLastSyncAt(nowISO());
+        return true;
+      } else {
+        setSyncStatus('Sync failed');
+        return false;
+      }
+    } catch (err) {
+      console.warn('Upload helper failed', err);
+      setSyncStatus('Sync failed');
+      return false;
+    }
+  }
+
+  // Manual sync: fetch remote, merge, upload merged
+  async function manualSync() {
+    try {
+      setSyncStatus('Syncing...');
+      const cs = await lazyCloud();
+      if (!cs || !cs.fetchEncryptedBlob) { setSyncStatus('No cloud'); return; }
+      const remote = await cs.fetchEncryptedBlob(passphrase);
+      if (!remote) { setSyncStatus('No remote'); return; }
+      const remoteDb = await decryptJSON(remote, passphrase);
+      const merged = mergeDatabases(db, remoteDb);
+      const localStr = JSON.stringify(db);
+      const mergedStr = JSON.stringify(merged);
+      if (localStr !== mergedStr) {
+        await saveDB(merged, passphrase);
+        await uploadCurrentEncryptedDB();
+        setDb(merged);
+      } else {
+        // still update from remote timestamp
+        setSyncStatus('Up to date');
+        setLastSyncAt(nowISO());
+      }
+    } catch (err) {
+      console.warn('Manual sync failed', err);
+      setSyncStatus('Sync failed');
+    }
+  }
+
   async function handleUnlock() {
     setLoading(true);
     try {
+      // Try to fetch cloud copy first (optional) and prefer it if available.
+      // Try to fetch cloud copy first (optional) and prefer it if available.
+      try {
+        const { fetchEncryptedBlob } = await lazyCloud();
+        if (fetchEncryptedBlob) {
+          try {
+            const remote = await fetchEncryptedBlob(passphrase);
+            if (remote) {
+              try {
+                const parsed = await decryptJSON(remote, passphrase);
+                setDb(parsed);
+                setUnlocked(true);
+                try { if (remember) localStorage.setItem('ttb:remembered-passphrase', passphrase); } catch(e) { /* ignore */ }
+                setLoading(false);
+                return;
+              } catch (e) {
+                console.warn('Remote DB decrypt failed, falling back to local', e);
+              }
+            }
+          } catch (e) {
+            console.warn('Failed to fetch remote DB', e);
+          }
+        }
+      } catch (e) { /* ignore */ }
       const loaded = await loadDB(passphrase);
       setDb(loaded);
       setUnlocked(true);
+      // after unlocking, attempt a merge-based sync (non-fatal)
+      (async () => {
+        try {
+          const { fetchEncryptedBlob, uploadEncryptedBlob } = await lazyCloud();
+          if (!fetchEncryptedBlob) return;
+          const remote = await fetchEncryptedBlob(passphrase);
+          if (!remote) return;
+          try {
+            const remoteDb = await decryptJSON(remote, passphrase);
+            // merge local and remote (dedupe by id)
+            const merged = mergeDatabases(loaded, remoteDb);
+            // if merged changed, persist and upload
+            const localStr = JSON.stringify(loaded);
+            const mergedStr = JSON.stringify(merged);
+            if (localStr !== mergedStr) {
+              await saveDB(merged, passphrase);
+              if (uploadEncryptedBlob) {
+                const encStr = await idbGet(STORAGE_KEY);
+                if (encStr) await uploadEncryptedBlob(passphrase, encStr);
+              }
+              setDb(merged);
+            }
+          } catch (e) {
+            console.warn('Remote decrypt/merge failed', e);
+          }
+        } catch (e) { /* ignore */ }
+      })();
+      // persist passphrase locally if user chose to remember it
+      try { if (remember) localStorage.setItem('ttb:remembered-passphrase', passphrase); } catch(e) { /* ignore */ }
     } catch (e) {
       alert(e.message || String(e));
       setUnlocked(false);
     } finally {
       setLoading(false);
+    }
+  }
+
+  // Auto-unlock if a remembered passphrase exists (device-only convenience)
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('ttb:remembered-passphrase');
+      if (saved) {
+        setPassphrase(saved);
+        setRemember(true);
+        // attempt to unlock in background
+        (async () => {
+          setLoading(true);
+          try {
+            const loaded = await loadDB(saved);
+            setDb(loaded);
+            setUnlocked(true);
+          } catch (err) {
+            // ignore failure (wrong passphrase); leave locked
+            console.warn('Auto-unlock failed:', err);
+          } finally { setLoading(false); }
+        })();
+      }
+    } catch (err) { /* ignore */ }
+  }, []);
+
+  // Listen for auth changes (optional)
+  useEffect(() => {
+    (async () => {
+      try {
+        const cs = await lazyCloud();
+        if (cs && (cs as any).onAuthChanged) {
+          // @ts-ignore
+          (cs).onAuthChanged((uid: string | null) => setAuthUser(uid));
+        }
+      } catch (e) { /* ignore */ }
+    })();
+  }, []);
+
+  // Lock the app: clear in-memory passphrase and optionally forget saved passphrase
+  function handleLock(forgetSaved = false) {
+    setPassphrase('');
+    setUnlocked(false);
+    setSelectedStudent(null);
+    if (forgetSaved) {
+      try { localStorage.removeItem('ttb:remembered-passphrase'); } catch(e) { /* ignore */ }
+      setRemember(false);
     }
   }
 
@@ -375,8 +570,19 @@ export default function App() {
       const newDb = { ...db, students: [newStudent, ...db.students] };
       setDb(newDb);
       await saveDB(newDb, passphrase);
+      // attempt cloud upload (non-fatal)
+        try {
+          await uploadCurrentEncryptedDB();
+        } catch (e) { console.warn('Cloud upload after add failed', e); }
       setForm(emptyForm);
-      alert("Student enrolled — saved securely.");
+      try {
+        // create an immediate backup/export so mobile browsers have a copy
+        await exportEncryptedDB();
+      } catch (e) {
+        // non-fatal
+        console.warn('Auto-export failed', e);
+      }
+      alert("Student enrolled — saved securely. An encrypted backup has been downloaded (if your browser allowed it).");
     } catch (err) {
       alert('Failed to save student: ' + (err.message || err));
     }
@@ -400,6 +606,7 @@ export default function App() {
       const newDb = { ...db, logs: [log, ...db.logs] };
       setDb(newDb);
       await saveDB(newDb, passphrase);
+      try { await uploadCurrentEncryptedDB(); } catch (e) { console.warn('Cloud upload after checkin failed', e); }
       alert(`${student.name} checked in at ${humanTime(log.timestamp)}`);
     } catch (e) {
       alert('Failed to record check-in: ' + (e.message || e));
@@ -414,6 +621,7 @@ export default function App() {
       const newDb = { ...db, logs: [log, ...db.logs] };
       setDb(newDb);
       await saveDB(newDb, passphrase);
+      try { await uploadCurrentEncryptedDB(); } catch (e) { console.warn('Cloud upload after checkout failed', e); }
       alert(`${student.name} checked out at ${humanTime(log.timestamp)} — collected by ${log.collectedBy}`);
     } catch (e) {
       alert('Failed to record check-out: ' + (e.message || e));
@@ -429,6 +637,7 @@ export default function App() {
       setDb(newDb);
       if (selectedStudent && selectedStudent.id === id) setSelectedStudent(null);
       await saveDB(newDb, passphrase);
+      try { await uploadCurrentEncryptedDB(); } catch (e) { console.warn('Cloud upload after delete failed', e); }
       alert('Student deleted.');
     } catch (err) {
       alert('Failed to delete student: ' + (err instanceof Error ? err.message : String(err)));
@@ -443,9 +652,47 @@ export default function App() {
       setDb(newDb);
       setSelectedStudent(null);
       await saveDB(newDb, passphrase);
+      try { await uploadCurrentEncryptedDB(); } catch (e) { console.warn('Cloud upload after clear failed', e); }
       alert('All enrollments cleared.');
     } catch (err) {
       alert('Failed to clear enrollments: ' + (err instanceof Error ? err.message : String(err)));
+    }
+  }
+
+  // Export the encrypted DB blob (as saved in storage) so user can back it up
+  async function exportEncryptedDB() {
+    try {
+      const blob = await idbGet(STORAGE_KEY);
+      if (!blob) return alert('No database found to export.');
+      const data = typeof blob === 'string' ? blob : String(blob);
+      const file = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(file);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'ttb-encrypted-db.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      alert('Exported encrypted DB to downloads.');
+    } catch (err) {
+      alert('Export failed: ' + (err instanceof Error ? err.message : String(err)));
+    }
+  }
+
+  // Import an encrypted DB blob file (will overwrite current stored DB)
+  async function handleImportFile(e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    if (!confirm('Importing will overwrite the local encrypted database. Continue?')) return;
+    try {
+      const txt = await f.text();
+      await idbPut(STORAGE_KEY, txt);
+      alert('Imported encrypted DB. Use your passphrase to unlock.');
+      // clear the file input
+      e.target.value = '';
+    } catch (err) {
+      alert('Import failed: ' + (err instanceof Error ? err.message : String(err)));
     }
   }
 
@@ -571,6 +818,28 @@ export default function App() {
             <button onClick={() => setView("checkout")} className={`px-3 py-2 rounded ${view==='checkout'?'bg-blue-600 text-white':'border'}`}>Check Out</button>
             <button onClick={() => setView("admin")} className={`px-3 py-2 rounded ${view==='admin'?'bg-blue-600 text-white':'border'}`}>Enrollment</button>
           </div>
+          <div className="flex items-center gap-2 text-sm">
+            <div className="px-3 py-2 rounded border">{syncStatus || 'No cloud'}</div>
+            {lastSyncAt && <div className="text-xs text-gray-500">Last sync: {new Date(lastSyncAt).toLocaleString()}</div>}
+            {authUser ? (
+              <button className="px-3 py-2 rounded border" onClick={async () => {
+                try { const cs = await lazyCloud(); if (cs && cs.signOut) await cs.signOut(); setAuthUser(null); } catch (e) { console.warn(e); }
+              }}>Sign out</button>
+            ) : (
+              <button className="px-3 py-2 rounded border" onClick={async () => {
+                const email = prompt('Email for Firebase sign-in');
+                if (!email) return;
+                const pass = prompt('Password');
+                if (!pass) return;
+                try {
+                  setSyncStatus('Signing in...');
+                  const cs = await lazyCloud();
+                  if (cs && cs.signIn) await cs.signIn(email, pass);
+                  setSyncStatus('Signed in');
+                } catch (e) { alert('Sign-in failed: ' + (e as any).message || e); setSyncStatus('Sign-in failed'); }
+              }}>Sign in</button>
+            )}
+          </div>
         </header>
 
         {view === "admin" && (
@@ -650,7 +919,12 @@ export default function App() {
             <div className="flex items-center justify-between">
               <h3 className="font-semibold">Enrolled Students</h3>
               <div>
-                <button onClick={handleClearAllEnrollments} disabled={db.students.length===0} className="px-3 py-1 rounded border text-sm">Clear All Enrollments</button>
+                  <button onClick={handleClearAllEnrollments} disabled={db.students.length===0} className="px-3 py-1 rounded border text-sm">Clear All Enrollments</button>
+                  <button onClick={exportEncryptedDB} className="ml-2 px-3 py-1 rounded border text-sm">Export DB</button>
+                  <label className="ml-2 px-3 py-1 rounded border text-sm cursor-pointer">
+                    Import
+                    <input type="file" accept=".json" onChange={(e) => handleImportFile(e)} className="hidden" />
+                  </label>
               </div>
             </div>
             <div className="mt-2 space-y-2">
