@@ -1,0 +1,39 @@
+name: Regenerate package-lock on Linux
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  regenerate-lockfile:
+    name: Regenerate package-lock on Ubuntu
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Clean and install (generate package-lock)
+        run: |
+          rm -rf node_modules package-lock.json || true
+          npm cache clean --force
+          npm install --no-audit --no-fund
+
+      - name: Commit package-lock.json if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json package.json || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Regenerate package-lock on Linux (avoid Windows-native rollup pin)"
+            git push
+          fi
