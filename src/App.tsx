@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useRef } from "react";
 // Optional cloud sync helpers (lazy, tolerant)
 // Helpers to lazily load cloud-sync at runtime (optional)
+// Trigger Vercel redeploy: 2025-09-30
 async function lazyCloud() {
   try {
     // dynamic import — will fail if src/cloud-config.ts is missing or firebase not configured
