@@ -1,24 +1,10 @@
 name: Regenerate package-lock on Linux
+
+on:
+  workflow_dispatch:
+
 permissions:
   contents: write
-
-# ... rest of your workflow steps ...
-
-# Ensure you use the GITHUB_TOKEN for pushing
-- name: Configure git
-  run: |
-    git config user.name "github-actions[bot]"
-    git config user.email "github-actions[bot]@users.noreply.github.com"
-
-- name: Commit and push changes
-  env:
-    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  run: |
-    git add package-lock.json
-    git commit -m "Regenerate package-lock on Linux (avoid Windows-native rollup pin)"
-    git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref }}
-on:
-  workflow_dispatch: {}
 
 jobs:
   regenerate-lockfile:
@@ -44,6 +30,8 @@ jobs:
           npm install --no-audit --no-fund
 
       - name: Commit package-lock.json if changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -52,5 +40,4 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "Regenerate package-lock on Linux (avoid Windows-native rollup pin)"
-            git push
-          fi
+            git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref }}
