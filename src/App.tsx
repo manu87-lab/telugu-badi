@@ -1,20 +1,257 @@
-import React, { useEffect, useState, useRef } from "react";
-// Optional cloud sync helpers (lazy, tolerant)
-// Helpers to lazily load cloud-sync at runtime (optional)
-// Trigger Vercel redeploy: 2025-09-30
-async function lazyCloud() {
-  try {
-    // dynamic import — will fail if src/cloud-config.ts is missing or firebase not configured
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const cs = await import('./cloud-sync');
-    return { uploadEncryptedBlob: cs.uploadEncryptedBlob, fetchEncryptedBlob: cs.fetchEncryptedBlob, signIn: cs.signIn, signOut: cs.signOut, onAuthChanged: cs.onAuthChanged };
-  } catch (e) {
-    return { uploadEncryptedBlob: null, fetchEncryptedBlob: null, signIn: null, signOut: null, onAuthChanged: null };
-  }
+import React, { useState, useEffect } from "react";
+import { getApps, initializeApp } from "firebase/app";
+import { getFirestore, doc, getDoc, setDoc } from "firebase/firestore";
+import Papa from "papaparse";
+import * as XLSX from "xlsx";
+import { FIREBASE_CONFIG } from "./cloud-config";
+
+// --- Check Student Page Component (with autocomplete) ---
+function CheckStudentPage({ db, logs }: { db: AppDB, logs: any[] }) {
+  const [search, setSearch] = React.useState("");
+  const [suggestions, setSuggestions] = React.useState<Student[]>([]);
+  const [selected, setSelected] = React.useState<Student | null>(null);
+  const [studentLogs, setStudentLogs] = React.useState<any[]>([]);
+  React.useEffect(() => {
+      if (search.trim() === "") {
+        setSuggestions([]);
+        return;
+      }
+      const studentsArr = Array.isArray(db.students) ? db.students : [];
+      const s = studentsArr.filter((stu: Student) =>
+        stu.name.toLowerCase().includes(search.toLowerCase()) ||
+        stu.id.toLowerCase().includes(search.toLowerCase())
+      );
+      setSuggestions(s.slice(0, 10));
+    }, [search, db.students]);
+  const handleSelect = (stu: Student) => {
+  setSelected(stu);
+  setSuggestions([]);
+  setSearch(stu.name);
+  const logsArr = Array.isArray(logs) ? logs : [];
+  const logsForStudent = logsArr.filter(l => l.studentId === stu.id).slice(-10).reverse();
+  setStudentLogs(logsForStudent);
+  };
+  return (
+    <div>
+      <h3 className="font-semibold mb-2">Check on Student</h3>
+      <div className="mb-4 relative">
+        <input
+          type="text"
+          value={search}
+          onChange={e => { setSearch(e.target.value); setSelected(null); setStudentLogs([]); }}
+          placeholder="Enter student name or ID..."
+          className="p-2 border rounded w-64"
+        />
+        {suggestions.length > 0 && (
+          <div className="absolute bg-white border rounded shadow w-64 z-10">
+            {suggestions.map(stu => (
+              <div
+                key={stu.id}
+                className="p-2 hover:bg-blue-100 cursor-pointer"
+                onClick={() => handleSelect(stu)}
+              >
+                {stu.name} <span className="text-xs text-gray-500">({stu.id})</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {selected ? (
+        <div className="mb-6 p-4 border rounded bg-white">
+          <div className="font-semibold text-lg mb-2">{selected.name}</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm">
+            <div><span className="font-semibold">Student ID:</span> {selected.id}</div>
+            <div><span className="font-semibold">Father Name:</span> {selected.fatherName || '-'}</div>
+            <div><span className="font-semibold">Mother Name:</span> {selected.motherName || '-'}</div>
+            <div><span className="font-semibold">Guardian Name:</span> {selected.guardian1Name || '-'}</div>
+            <div><span className="font-semibold">Date of Birth:</span> {selected.dateOfBirth || '-'}</div>
+            <div><span className="font-semibold">Contact:</span> {selected.contact || '-'}</div>
+            <div><span className="font-semibold">Email:</span> {selected.email || '-'}</div>
+            <div><span className="font-semibold">Address:</span> {selected.address || '-'}</div>
+          </div>
+        </div>
+      ) : (
+        <div className="mb-6 text-gray-500">Type student name or ID and select from the list.</div>
+      )}
+      {selected && (
+        <div>
+          <h3 className="font-semibold mb-2">Last 10 Check-in/Check-out Logs</h3>
+          <div className="grid gap-2">
+            {studentLogs.length === 0 && <div className="text-gray-500">No logs found.</div>}
+            {studentLogs.map((log: any) => (
+              <div key={log.id} className="p-2 border rounded bg-white text-sm">
+                <span className="font-semibold">{log.type === 'checkin' ? '📥 Check In' : '📤 Check Out'}</span>
+                {log.guardian && <span className="ml-2">Guardian: {log.guardian}</span>}
+                <span className="ml-2 text-gray-500">{new Date(log.timestamp).toLocaleString()}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
-// ---- Types ----
-type PhotoSet = { student?: string; father?: string; mother?: string; guardian1?: string; guardian2?: string };
+// --- UpdateStudentPage Component ---
+function UpdateStudentPage({ db, setDb, classOptions }: { db: AppDB, setDb: any, classOptions: string[] }) {
+  const [search, setSearch] = useState("");
+  const [suggestions, setSuggestions] = useState<Student[]>([]);
+  const [selected, setSelected] = useState<Student | null>(null);
+  const [editMode, setEditMode] = useState(false);
+  const [editForm, setEditForm] = useState<any>({});
+  const [message, setMessage] = useState("");
+  // classOptions is passed for props typing, not used directly in this component
+  useEffect(() => {
+    if (search.trim() === "") {
+      setSuggestions([]);
+      return;
+    }
+    const studentsArr = Array.isArray(db.students) ? db.students : [];
+    const s = studentsArr.filter((stu: Student) =>
+      stu.name.toLowerCase().includes(search.toLowerCase()) ||
+      stu.id.toLowerCase().includes(search.toLowerCase())
+    );
+    setSuggestions(s.slice(0, 10));
+  }, [search, db.students]);
+  const handleSelect = (stu: Student) => {
+    setSelected(stu);
+    setEditMode(false);
+    setEditForm({ ...stu });
+    setMessage("");
+    setSuggestions([]);
+    setSearch(stu.name);
+  };
+  const handleDelete = () => {
+    if (!selected) return;
+    setDb((prev: AppDB) => ({
+      ...prev,
+      students: (Array.isArray(prev.students) ? prev.students : []).filter((s: Student) => s.id !== selected.id)
+    }));
+    setMessage(`Student ${selected.name}, ${selected.id} deleted successfully.`);
+    setSelected(null);
+    setEditMode(false);
+    setEditForm({});
+  };
+  const handleEdit = () => {
+    setEditMode(true);
+    setEditForm({ ...selected });
+    setMessage("");
+  };
+  const handleSave = () => {
+    if (!selected) return;
+    setDb((prev: AppDB) => ({
+      ...prev,
+      students: (Array.isArray(prev.students) ? prev.students : []).map((s: Student) =>
+        s.id === selected.id ? { ...s, ...editForm, id: selected.id, name: selected.name } : s
+      )
+    }));
+    setMessage("Student updated successfully.");
+    setEditMode(false);
+    setSelected({ ...selected, ...editForm });
+  };
+  return (
+    <div className="mb-8">
+      <h3 className="font-semibold mb-2">Update or Delete Student</h3>
+      <input
+        type="text"
+        value={search}
+        onChange={e => { setSearch(e.target.value); setSelected(null); setEditMode(false); setMessage(""); }}
+        placeholder="Search by name or ID..."
+        className="p-2 border rounded w-64 mb-2"
+      />
+      {suggestions.length > 0 && (
+        <div className="bg-white border rounded shadow w-64 z-10">
+          {suggestions.map(stu => (
+            <div
+              key={stu.id}
+              className="p-2 hover:bg-blue-100 cursor-pointer"
+              onClick={() => handleSelect(stu)}
+            >
+              {stu.name} <span className="text-xs text-gray-500">({stu.id})</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {selected && !editMode && (
+        <div className="p-4 border rounded bg-white mt-4">
+          <div className="font-semibold text-lg mb-2">{selected.name}</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm">
+            <div><span className="font-semibold">Student ID:</span> {selected.id}</div>
+            <div><span className="font-semibold">Father Name:</span> {selected.fatherName || '-'}</div>
+            <div><span className="font-semibold">Mother Name:</span> {selected.motherName || '-'}</div>
+            <div><span className="font-semibold">Guardian Name:</span> {selected.guardian1Name || '-'}</div>
+            <div><span className="font-semibold">Date of Birth:</span> {selected.dateOfBirth || '-'}</div>
+            <div><span className="font-semibold">Contact:</span> {selected.contact || '-'}</div>
+            <div><span className="font-semibold">Email:</span> {selected.email || '-'}</div>
+            <div><span className="font-semibold">Address:</span> {selected.address || '-'}</div>
+          </div>
+          <div className="mt-4 flex gap-2">
+            <button className="px-4 py-2 bg-yellow-500 text-white rounded" onClick={handleEdit}>Edit</button>
+            <button className="px-4 py-2 bg-red-600 text-white rounded" onClick={handleDelete}>Delete</button>
+          </div>
+          {message && <div className="mt-2 text-green-700">{message}</div>}
+        </div>
+      )}
+      {selected && editMode && (
+        <div className="p-4 border rounded bg-white mt-4">
+          <div className="font-semibold text-lg mb-2">{selected.name}</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-sm">
+            {/* Only allow editing fields except name and id */}
+            <input
+              className="p-2 border rounded"
+              placeholder="Father Name"
+              value={editForm.fatherName || ""}
+              onChange={e => setEditForm((f: any) => ({ ...f, fatherName: e.target.value }))}
+            />
+            <input
+              className="p-2 border rounded"
+              placeholder="Mother Name"
+              value={editForm.motherName || ""}
+              onChange={e => setEditForm((f: any) => ({ ...f, motherName: e.target.value }))}
+            />
+            <input
+              className="p-2 border rounded"
+              placeholder="Guardian Name"
+              value={editForm.guardian1Name || ""}
+              onChange={e => setEditForm((f: any) => ({ ...f, guardian1Name: e.target.value }))}
+            />
+            <input
+              className="p-2 border rounded"
+              placeholder="Date of Birth"
+              value={editForm.dateOfBirth || ""}
+              onChange={e => setEditForm((f: any) => ({ ...f, dateOfBirth: e.target.value }))}
+            />
+            <input
+              className="p-2 border rounded"
+              placeholder="Contact"
+              value={editForm.contact || ""}
+              onChange={e => setEditForm((f: any) => ({ ...f, contact: e.target.value }))}
+            />
+            <input
+              className="p-2 border rounded"
+              placeholder="Email"
+              value={editForm.email || ""}
+              onChange={e => setEditForm((f: any) => ({ ...f, email: e.target.value }))}
+            />
+            <input
+              className="p-2 border rounded md:col-span-2"
+              placeholder="Address"
+              value={editForm.address || ""}
+              onChange={e => setEditForm((f: any) => ({ ...f, address: e.target.value }))}
+            />
+          </div>
+          <div className="mt-4 flex gap-2">
+            <button className="px-4 py-2 bg-blue-600 text-white rounded" onClick={handleSave}>Save</button>
+            <button className="px-4 py-2 bg-gray-400 text-white rounded" onClick={() => setEditMode(false)}>Cancel</button>
+          </div>
+          {message && <div className="mt-2 text-green-700">{message}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- Types ---
 type Student = {
   id: string;
   name: string;
@@ -23,1111 +260,584 @@ type Student = {
   fatherName?: string;
   motherName?: string;
   guardian1Name?: string;
-  guardian2Name?: string;
   contact?: string;
   email?: string;
   address?: string;
-  photos?: PhotoSet;
 };
 type AppDB = { students: Student[]; logs: any[] };
 
-/*
-Triangle Telugu Badi - Single-file React app (fixed storage)
-
-This version fixes a `QuotaExceededError` that occurred when storing
-large encrypted data (images + JSON) into localStorage.
-
-Fixes applied:
-1. Use IndexedDB (preferred) for storing the encrypted database blob. IndexedDB
-   has much larger storage quotas than localStorage and is appropriate for
-   storing images and encrypted data.
-2. Client-side image compression on upload (canvas -> JPEG at reduced quality)
-   to dramatically reduce the size of stored images before encryption.
-3. Robust fallback: if IndexedDB write fails, attempt localStorage; if that
-   also fails due to quota, a clear, actionable error is raised.
-
-Notes:
-- This file keeps the same high-level app behavior (enrollment, check-in,
-  check-out) but replaces the storage layer and compresses images.
-- For production, consider server-side sync and authenticated backups.
-*/
-
-// ---------------------------
-// Imports & Globals
-// ---------------------------
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-const STORAGE_KEY = "ttb:encrypted-db"; // used as key inside IndexedDB 'kv' store
-
-// ---------------------------
-// IndexedDB helpers (small wrapper)
-// ---------------------------
-async function openIndexedDB() {
-  if (!('indexedDB' in window)) throw new Error('IndexedDB not supported in this browser');
-  return new Promise((resolve, reject) => {
-    const req = window.indexedDB.open('ttb-indexeddb', 1);
-    req.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
-  });
-}
-
-async function idbPut(key, value) {
-  const db = await openIndexedDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('kv', 'readwrite');
-    const store = tx.objectStore('kv');
-    const r = store.put(value, key);
-    r.onsuccess = () => resolve();
-    r.onerror = () => reject(r.error || new Error('IDB put failed'));
-  });
-}
-
-async function idbGet(key) {
-  const db = await openIndexedDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('kv', 'readonly');
-    const store = tx.objectStore('kv');
-    const r = store.get(key);
-    r.onsuccess = () => resolve(r.result === undefined ? null : r.result);
-    r.onerror = () => reject(r.error || new Error('IDB get failed'));
-  });
-}
-
-async function idbDelete(key) {
-  const db = await openIndexedDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('kv', 'readwrite');
-    const store = tx.objectStore('kv');
-    const r = store.delete(key);
-    r.onsuccess = () => resolve();
-    r.onerror = () => reject(r.error || new Error('IDB delete failed'));
-  });
-}
-
-// ---------------------------
-// Crypto helpers (unchanged core logic)
-// ---------------------------
-async function deriveKeyFromPassphrase(passphrase, salt) {
-  const passKey = await window.crypto.subtle.importKey(
-    "raw",
-    enc.encode(passphrase),
-    { name: "PBKDF2" },
-    false,
-    ["deriveKey"]
-  );
-  return window.crypto.subtle.deriveKey(
-    {
-      name: "PBKDF2",
-      salt,
-      iterations: 200000,
-      hash: "SHA-256",
-    },
-    passKey,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"]
-  );
-}
-
-async function encryptJSON(obj, passphrase) {
-  const salt = window.crypto.getRandomValues(new Uint8Array(16));
-  const iv = window.crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveKeyFromPassphrase(passphrase, salt);
-  const data = enc.encode(JSON.stringify(obj));
-  const cipher = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
-  // store as base64 for portability
-  return JSON.stringify({
-    salt: arrayBufferToBase64(salt.buffer),
-    iv: arrayBufferToBase64(iv.buffer),
-    cipher: arrayBufferToBase64(cipher),
-  });
-}
-
-async function decryptJSON(encryptedStr, passphrase) {
-  const parsed = JSON.parse(encryptedStr);
-  const salt = base64ToArrayBuffer(parsed.salt);
-  const iv = base64ToArrayBuffer(parsed.iv);
-  const cipher = base64ToArrayBuffer(parsed.cipher);
-  const key = await deriveKeyFromPassphrase(passphrase, new Uint8Array(salt));
-  try {
-    const plain = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(iv) }, key, cipher);
-    return JSON.parse(dec.decode(plain));
-  } catch (e) {
-    throw new Error("Decryption failed: wrong passphrase or corrupted data.");
-  }
-}
-
-function arrayBufferToBase64(buffer) {
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return window.btoa(binary);
-}
-
-function base64ToArrayBuffer(base64) {
-  const binary = window.atob(base64);
-  const len = binary.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
-
-// ---------------------------
-// Storage layer (use IndexedDB first, fallback to localStorage)
-// ---------------------------
-async function loadDB(passphrase) {
-  // Try IndexedDB first
-  try {
-    const blob = await idbGet(STORAGE_KEY);
-    if (blob) return decryptJSON(blob, passphrase);
-  } catch (e) {
-    // IndexedDB failure — continue to fallback
-    console.warn('IndexedDB load failed, falling back to localStorage', e);
-  }
-  // Fallback for older data stored in localStorage
-  const ls = localStorage.getItem(STORAGE_KEY);
-  if (!ls) return { students: [], logs: [] };
-  // Migrate to IndexedDB if possible (best-effort)
-  try {
-    await idbPut(STORAGE_KEY, ls);
-    try { localStorage.removeItem(STORAGE_KEY); } catch (e) { /* ignore */ }
-  } catch (e) {
-    // Ignore migration errors
-  }
-  return decryptJSON(ls, passphrase);
-}
-
-async function saveDB(dbObj: AppDB, passphrase: string) {
-  const encStr = await encryptJSON(dbObj, passphrase);
-  // Prefer IndexedDB
-  try {
-    await idbPut(STORAGE_KEY, encStr);
-    return;
-  } catch (e) {
-    console.warn('IndexedDB write failed, attempting localStorage', e);
-  }
-  // Fallback to localStorage (may throw QuotaExceededError)
-  try {
-    localStorage.setItem(STORAGE_KEY, encStr);
-    return;
-  } catch (e) {
-    // Provide a helpful error for quota problems
-    if (e && (e.name === 'QuotaExceededError' || e.code === 22 || e.number === -2147024882)) {
-      throw new Error('Storage quota exceeded: cannot save data. Try removing large photos, clear storage, or use a device with more available storage.');
-    }
-    throw e;
-  }
-}
-
-// ---------------------------
-// Helpers
-// ---------------------------
-function uid(prefix = "id") {
-  return prefix + "_" + Math.random().toString(36).slice(2, 9);
-}
-
-// Generate student ID in the format:
-// TATATB-<YY><YY+1><classCode><seq>
-// Example: enrollment in 2025, class Pravesham (01), first student -> TATATB-2526010001
-function generateStudentId(classSection: string, enrollmentYear?: number, existingStudents?: Student[]) {
-  const classMap: Record<string, string> = {
-    Pravesham: '01',
-    Pravalam: '02',
-    Pradhanam: '03',
-    Pravardham: '04',
-    Praaveenyam: '05',
-  };
-  const year = enrollmentYear || new Date().getFullYear();
-  const yyStart = String(year).slice(-2);
-  const yyEnd = String(year + 1).slice(-2);
-  const yearPart = `${yyStart}${yyEnd}`; // e.g. '2526'
-  const classCode = classMap[classSection] || '00';
-  const prefix = `TATATB-${yearPart}${classCode}`;
-
-  // Count existing students that match this prefix to determine the next sequence
-  const list = existingStudents || [];
-  const regex = new RegExp(`^${prefix}(\\d{4})$`);
-  let maxSeq = 0;
-  for (const s of list) {
-    const m = s.id.match(regex);
-    if (m) {
-      const seq = parseInt(m[1], 10);
-      if (!isNaN(seq) && seq > maxSeq) maxSeq = seq;
-    }
-  }
-  const nextSeq = (maxSeq + 1).toString().padStart(4, '0');
-  return `${prefix}${nextSeq}`;
-}
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function humanTime(iso: string) {
-  const d = new Date(iso);
-  return d.toLocaleString();
-}
-
-// Add this new function
-function calculateAge(dateOfBirth) {
-  if (!dateOfBirth) return "";
+// Helper to calculate age from date of birth
+function calculateAge(dateOfBirth: string) {
+  if (!dateOfBirth) return "-";
   const today = new Date();
-  const birthDate = new Date(dateOfBirth);
-  let age = today.getFullYear() - birthDate.getFullYear();
-  const monthDiff = today.getMonth() - birthDate.getMonth();
-  
-  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+  const dob = new Date(dateOfBirth);
+  let age = today.getFullYear() - dob.getFullYear();
+  const m = today.getMonth() - dob.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < dob.getDate())) {
     age--;
   }
-  
   return age;
-}
-
-// Merge two AppDB objects: union students (by id, prefer local), union logs (dedupe by id, keep newest)
-function mergeDatabases(localDb: AppDB, remoteDb: AppDB): AppDB {
-  const studentsMap: Record<string, Student> = {};
-  for (const r of (remoteDb.students || [])) studentsMap[r.id] = r;
-  for (const l of (localDb.students || [])) studentsMap[l.id] = l; // local wins
-  const mergedStudents = Object.values(studentsMap);
-
-  const logMap: Record<string, any> = {};
-  const allLogs = [...(remoteDb.logs || []), ...(localDb.logs || [])];
-  for (const lg of allLogs) {
-    if (!lg || !lg.id) continue;
-    if (!logMap[lg.id]) logMap[lg.id] = lg;
-    else {
-      // keep the one with later timestamp if available
-      try {
-        const a = new Date(logMap[lg.id].timestamp || 0).getTime();
-        const b = new Date(lg.timestamp || 0).getTime();
-        if (b > a) logMap[lg.id] = lg;
-      } catch (e) { /* ignore */ }
-    }
-  }
-  const mergedLogs = Object.values(logMap).sort((a: any, b: any) => (new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()));
-  return { students: mergedStudents, logs: mergedLogs };
-}
-
-// Compress image file via canvas -> JPEG (reduces size dramatically)
-function fileToDataUrl(file: File | null, maxDim = 900, quality = 0.75) {
-  return new Promise<string | null>((res, rej) => {
-    if (!file) return res(null);
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        let { width, height } = img as HTMLImageElement;
-        const max = maxDim;
-        if (width > max || height > max) {
-          const ratio = Math.min(max / width, max / height);
-          width = Math.round(width * ratio);
-          height = Math.round(height * ratio);
-        }
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return rej(new Error('Canvas 2D context unavailable'));
-  ctx.drawImage(img, 0, 0, width, height);
-        // Convert to JPEG to reduce size (even for PNG originals)
-        const dataUrl = canvas.toDataURL('image/jpeg', quality);
-        res(dataUrl);
-      };
-      img.onerror = () => rej(new Error('Image load failed'));
-      img.src = String(reader.result);
-    };
-    reader.onerror = (err) => rej(err);
-    reader.readAsDataURL(file);
-  });
 }
 
 // ---------------------------
 // Main React App
 // ---------------------------
-export default function App() {
-  const [passphrase, setPassphrase] = useState<string>("");
-  const [db, setDb] = useState<AppDB>({ students: [], logs: [] });
-  const [unlocked, setUnlocked] = useState<boolean>(false);
-  const [authUser, setAuthUser] = useState<string | null>(null);
-  const [syncStatus, setSyncStatus] = useState<string | null>(null);
-  const [lastSyncAt, setLastSyncAt] = useState<string | null>(null);
-  const [remember, setRemember] = useState<boolean>(false);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [view, setView] = useState<string>("checkin"); // checkin | checkout | admin
 
-  const emptyForm = {
-    id: "",
-    name: "",
+export default function App() {
+  const [checkoutStatus, setCheckoutStatus] = useState<{[id: string]: boolean}>({});
+  const [checkoutMessage, setCheckoutMessage] = useState<string>("");
+  const [checkedIn, setCheckedIn] = useState<{[id: string]: boolean}>({});
+  const [checkedOut, setCheckedOut] = useState<{[id: string]: boolean}>({});
+  // ...existing state...
+  const [adminTab, setAdminTab] = useState<'enroll' | 'updatestudent' | 'checkstudent'>('enroll');
+  const [db, setDb] = useState<AppDB>({ students: [], logs: [] });
+  // Firestore setup
+  const TEST_UID = 'testuser_shared';
+  const [firestoreReady, setFirestoreReady] = useState(false);
+  let firestore: any = null;
+  function getFirestoreClient() {
+    if (!getApps().length) initializeApp(FIREBASE_CONFIG);
+    return getFirestore();
+  }
+  // View: 'checkin', 'checkout', 'admin', 'enroll', 'checkstudent'
+  const [view, setView] = useState<string>("checkin");
+  // Removed unused checkoutGuardian state
+  // Enrollment form state
+  const [enrollForm, setEnrollForm] = useState({
+    studentFullName: "",
     classSection: "Pravesham",
     dateOfBirth: "",
-    fatherName: "",
-    motherName: "",
-    guardian1Name: "",
-    guardian2Name: "",
+    fatherFullName: "",
+    motherFullName: "",
+    guardianName: "",
     contact: "",
+    altContact: "",
     email: "",
     address: "",
-    photos: { student: "", father: "", mother: "", guardian1: "", guardian2: "" },
-  };
-  const [form, setForm] = useState<any>(emptyForm);
-  const [searchTerm, setSearchTerm] = useState<string>("");
-  const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
-  const [checkoutGuardian, setCheckoutGuardian] = useState<string>("");
-  // New states for class-based selection + autocomplete
+  });
+  const [enrollError, setEnrollError] = useState<string>("");
+  const [enrollSuccess, setEnrollSuccess] = useState<boolean>(false);
+  // Class options for selection
   const classOptions = ["Pravesham", "Pravalam", "Pradhanam", "Pravardham", "Praaveenyam"];
   const [checkinClass, setCheckinClass] = useState(classOptions[0]);
   const [checkinQuery, setCheckinQuery] = useState("");
   const [checkoutClass, setCheckoutClassState] = useState(classOptions[0]);
   const [checkoutQuery, setCheckoutQuery] = useState("");
 
-  // Centralized uploader: uploads current encrypted DB and updates UI state
-  async function uploadCurrentEncryptedDB() {
-    try {
-      setSyncStatus('Syncing...');
-      const cs = await lazyCloud();
-      if (!cs || !cs.uploadEncryptedBlob) {
-        setSyncStatus('No cloud');
-        return false;
-      }
-      const encStr = await idbGet(STORAGE_KEY);
-      if (!encStr) { setSyncStatus('No data'); return false; }
-      const ok = await cs.uploadEncryptedBlob(passphrase, String(encStr));
-      if (ok) {
-        setSyncStatus('Synced');
-        setLastSyncAt(nowISO());
-        return true;
-      } else {
-        setSyncStatus('Sync failed');
-        return false;
-      }
-    } catch (err) {
-      console.warn('Upload helper failed', err);
-      setSyncStatus('Sync failed');
-      return false;
+  // Track checked-in and checked-out students
+  // Removed unused checkedIn and checkedOut state
+  const [selectedGuardian, setSelectedGuardian] = useState<{[id: string]: string}>({});
+
+  // For Check on Student view
+  // Removed unused studentSearch, studentResult, studentLogs state
+
+  // Bulk enrollment state and handlers
+  const [bulkFile, setBulkFile] = useState<File|null>(null);
+  const [bulkUploadMessage, setBulkUploadMessage] = useState<string>("");
+  const [bulkUploadError, setBulkUploadError] = useState<string>("");
+
+  function handleBulkFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    setBulkUploadMessage("");
+    setBulkUploadError("");
+    if (e.target.files && e.target.files[0]) {
+      setBulkFile(e.target.files[0]);
+    } else {
+      setBulkFile(null);
     }
   }
 
-  // Manual sync: fetch remote, merge, upload merged
-  async function manualSync() {
-    try {
-      setSyncStatus('Syncing...');
-      const cs = await lazyCloud();
-      if (!cs || !cs.fetchEncryptedBlob) { setSyncStatus('No cloud'); return; }
-      const remote = await cs.fetchEncryptedBlob(passphrase);
-      if (!remote) { setSyncStatus('No remote'); return; }
-      const remoteDb = await decryptJSON(remote, passphrase);
-      const merged = mergeDatabases(db, remoteDb);
-      const localStr = JSON.stringify(db);
-      const mergedStr = JSON.stringify(merged);
-      if (localStr !== mergedStr) {
-        await saveDB(merged, passphrase);
-        await uploadCurrentEncryptedDB();
-        setDb(merged);
-      } else {
-        // still update from remote timestamp
-        setSyncStatus('Up to date');
-        setLastSyncAt(nowISO());
-      }
-    } catch (err) {
-      console.warn('Manual sync failed', err);
-      setSyncStatus('Sync failed');
-    }
-  }
-
-  async function handleUnlock() {
-    setLoading(true);
-    try {
-      // Try to fetch cloud copy first (optional) and prefer it if available.
-      // Try to fetch cloud copy first (optional) and prefer it if available.
-      try {
-        const { fetchEncryptedBlob } = await lazyCloud();
-        if (fetchEncryptedBlob) {
-          try {
-            const remote = await fetchEncryptedBlob(passphrase);
-            if (remote) {
-              try {
-                const parsed = await decryptJSON(remote, passphrase);
-                setDb(parsed);
-                setUnlocked(true);
-                try { if (remember) localStorage.setItem('ttb:remembered-passphrase', passphrase); } catch(e) { /* ignore */ }
-                setLoading(false);
-                return;
-              } catch (e) {
-                console.warn('Remote DB decrypt failed, falling back to local', e);
-              }
-            }
-          } catch (e) {
-            console.warn('Failed to fetch remote DB', e);
-          }
-        }
-      } catch (e) { /* ignore */ }
-      const loaded = await loadDB(passphrase);
-      setDb(loaded);
-      setUnlocked(true);
-      // after unlocking, attempt a merge-based sync (non-fatal)
-      (async () => {
-        try {
-          const { fetchEncryptedBlob, uploadEncryptedBlob } = await lazyCloud();
-          if (!fetchEncryptedBlob) return;
-          const remote = await fetchEncryptedBlob(passphrase);
-          if (!remote) return;
-          try {
-            const remoteDb = await decryptJSON(remote, passphrase);
-            // merge local and remote (dedupe by id)
-            const merged = mergeDatabases(loaded, remoteDb);
-            // if merged changed, persist and upload
-            const localStr = JSON.stringify(loaded);
-            const mergedStr = JSON.stringify(merged);
-            if (localStr !== mergedStr) {
-              await saveDB(merged, passphrase);
-              if (uploadEncryptedBlob) {
-                const encStr = await idbGet(STORAGE_KEY);
-                if (encStr) await uploadEncryptedBlob(passphrase, encStr);
-              }
-              setDb(merged);
-            }
-          } catch (e) {
-            console.warn('Remote decrypt/merge failed', e);
-          }
-        } catch (e) { /* ignore */ }
-      })();
-      // persist passphrase locally if user chose to remember it
-      try { if (remember) localStorage.setItem('ttb:remembered-passphrase', passphrase); } catch(e) { /* ignore */ }
-    } catch (e) {
-      alert(e.message || String(e));
-      setUnlocked(false);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // Auto-unlock if a remembered passphrase exists (device-only convenience)
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem('ttb:remembered-passphrase');
-      if (saved) {
-        setPassphrase(saved);
-        setRemember(true);
-        // attempt to unlock in background
-        (async () => {
-          setLoading(true);
-          try {
-            const loaded = await loadDB(saved);
-            setDb(loaded);
-            setUnlocked(true);
-          } catch (err) {
-            // ignore failure (wrong passphrase); leave locked
-            console.warn('Auto-unlock failed:', err);
-          } finally { setLoading(false); }
-        })();
-      }
-    } catch (err) { /* ignore */ }
-  }, []);
-
-  // Listen for auth changes (optional)
-  useEffect(() => {
-    (async () => {
-      try {
-        const cs = await lazyCloud();
-        if (cs && (cs as any).onAuthChanged) {
-          // @ts-ignore
-          (cs).onAuthChanged((uid: string | null) => setAuthUser(uid));
-        }
-      } catch (e) { /* ignore */ }
-    })();
-  }, []);
-
-  // Lock the app: clear in-memory passphrase and optionally forget saved passphrase
-  function handleLock(forgetSaved = false) {
-    setPassphrase('');
-    setUnlocked(false);
-    setSelectedStudent(null);
-    if (forgetSaved) {
-      try { localStorage.removeItem('ttb:remembered-passphrase'); } catch(e) { /* ignore */ }
-      setRemember(false);
-    }
-  }
-
-  // Admin: Add student (compress photos before saving)
-  async function handleAddStudent(e) {
+  async function handleBulkUpload(e: React.MouseEvent<HTMLButtonElement>) {
     e.preventDefault();
+    setBulkUploadMessage("");
+    setBulkUploadError("");
+    if (!bulkFile) return;
     try {
-      // Ensure required photo keys exist (they may already be dataURLs)
-      const photos = { ...form.photos };
-      // If any of the photos are File objects (they aren't in our current code), handle here.
-      // In this UI we already convert to data URLs on upload, so assume strings.
-
-  const id = generateStudentId(form.classSection || 'Pravesham', new Date().getFullYear(), db.students);
-  const newStudent: Student = { ...form, id, photos } as Student;
-      const newDb = { ...db, students: [newStudent, ...db.students] };
-      setDb(newDb);
-      await saveDB(newDb, passphrase);
-      // attempt cloud upload (non-fatal)
-        try {
-          await uploadCurrentEncryptedDB();
-        } catch (e) { console.warn('Cloud upload after add failed', e); }
-      setForm(emptyForm);
-      try {
-        // create an immediate backup/export so mobile browsers have a copy
-        await exportEncryptedDB();
-      } catch (e) {
-        // non-fatal
-        console.warn('Auto-export failed', e);
+      let students: any[] = [];
+      if (bulkFile.name.endsWith('.csv')) {
+        const text = await bulkFile.text();
+        const result = Papa.parse(text, { header: true });
+        students = result.data;
+      } else if (bulkFile.name.endsWith('.xlsx') || bulkFile.name.endsWith('.xls')) {
+        const data = await bulkFile.arrayBuffer();
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        students = XLSX.utils.sheet_to_json(sheet);
+      } else {
+        setBulkUploadError('Unsupported file type. Please upload a CSV or Excel file.');
+        return;
       }
-      alert("Student enrolled — saved securely. An encrypted backup has been downloaded (if your browser allowed it).");
-    } catch (err) {
-      alert('Failed to save student: ' + (err.message || err));
+      // Required fields: student name, date of birth, class allocated, father name, mother name, guardian name, contact number, email address, address
+      let added = 0, skipped = 0;
+  // required fields list removed (was unused)
+      const newStudents = students.map((row: any) => ({
+        name: row['student name'] || row['Student Name'] || row['Name'] || '',
+        dateOfBirth: row['date of birth'] || row['Date of Birth'] || '',
+        classSection: row['class allocated'] || row['Class Allocated'] || '',
+        fatherName: row['father name'] || row['Father Name'] || '',
+        motherName: row['mother name'] || row['Mother Name'] || '',
+        guardian1Name: row['guardian name'] || row['Guardian Name'] || '',
+        contact: row['contact number'] || row['Contact Number'] || '',
+        email: row['email address'] || row['Email Address'] || '',
+        address: row['address'] || row['Address'] || '',
+      }));
+      const filtered = newStudents.filter(s => s.name && s.dateOfBirth && s.classSection);
+      setDb(prev => {
+        let studentsArr = [...prev.students];
+        filtered.forEach(s => {
+          const exists = studentsArr.some(stu =>
+            stu.name.trim().toUpperCase() === s.name.trim().toUpperCase() &&
+            stu.dateOfBirth === s.dateOfBirth &&
+            (stu.contact?.trim().toUpperCase() === (s.contact || '').trim().toUpperCase())
+          );
+          if (!exists) {
+            studentsArr.push({
+              id: `TATB-${Date.now()}-${Math.floor(Math.random()*10000)}`,
+              ...s,
+            });
+            added++;
+          } else {
+            skipped++;
+          }
+        });
+        return { ...prev, students: studentsArr };
+      });
+      setBulkUploadMessage(`Bulk upload complete. Added: ${added}, Skipped (duplicates): ${skipped}`);
+      setBulkFile(null);
+    } catch (err: any) {
+      setBulkUploadError('Failed to process file: ' + (err?.message || err));
     }
   }
 
-  function findMatches(term) {
-    if (!term) return db.students.slice(0, 50);
-    const t = term.trim().toLowerCase();
-    return db.students.filter((s) => {
-      return (
-        (s.name || '').toLowerCase().includes(t) ||
-        (s.id || '').toLowerCase().includes(t) ||
-        (s.classSection || '').toLowerCase().includes(t)
-      );
-    });
-  }
+  // Load initial data from Firestore
+  useEffect(() => {
+    const loadFromFirestore = async () => {
+      try {
+        firestore = getFirestoreClient();
+        setFirestoreReady(true);
+        const ref = doc(firestore, 'users', TEST_UID, 'ttb_sync', 'main');
+        const snap = await getDoc(ref);
+        if (snap.exists()) {
+          const data = snap.data();
+          if (data && data.blob) {
+            setDb(JSON.parse(data.blob));
+          }
+        }
+      } catch (e) {
+        console.error('Failed to load from Firestore:', e);
+      }
+    };
+    loadFromFirestore();
+    // eslint-disable-next-line
+  }, []);
 
-  async function handleCheckIn(student: Student) {
-    try {
-      const log = { id: uid("L"), studentId: student.id, studentName: student.name, classSection: student.classSection, type: "checkin", timestamp: nowISO() };
-      const newDb = { ...db, logs: [log, ...db.logs] };
-      setDb(newDb);
-      await saveDB(newDb, passphrase);
-      try { await uploadCurrentEncryptedDB(); } catch (e) { console.warn('Cloud upload after checkin failed', e); }
-      alert(`${student.name} checked in at ${humanTime(log.timestamp)}`);
-    } catch (e) {
-      alert('Failed to record check-in: ' + (e.message || e));
-    }
-  }
+  // Save data changes to Firestore
+  useEffect(() => {
+    if (!firestoreReady) return;
+    const uploadToFirestore = async () => {
+      try {
+        firestore = getFirestoreClient();
+        const ref = doc(firestore, 'users', TEST_UID, 'ttb_sync', 'main');
+        await setDoc(ref, { blob: JSON.stringify(db), updatedAt: new Date().toISOString() });
+      } catch (e) {
+        console.error('Failed to upload to Firestore:', e);
+      }
+    };
+    uploadToFirestore();
+    // eslint-disable-next-line
+  }, [db]);
 
-  async function handleCheckOut(student, guardianKey) {
-    if (!guardianKey) return alert("Please select the guardian/person collecting the child.");
-    try {
-      const guardianName = guardianKey === "father" ? student.fatherName : guardianKey === "mother" ? student.motherName : guardianKey === "guardian1" ? student.guardian1Name : student.guardian2Name;
-      const log = { id: uid("L"), studentId: student.id, studentName: student.name, classSection: student.classSection, type: "checkout", timestamp: nowISO(), collectedBy: guardianName || guardianKey };
-      const newDb = { ...db, logs: [log, ...db.logs] };
-      setDb(newDb);
-      await saveDB(newDb, passphrase);
-      try { await uploadCurrentEncryptedDB(); } catch (e) { console.warn('Cloud upload after checkout failed', e); }
-      alert(`${student.name} checked out at ${humanTime(log.timestamp)} — collected by ${log.collectedBy}`);
-    } catch (e) {
-      alert('Failed to record check-out: ' + (e.message || e));
-    }
-  }
-
-  // Delete a single student by id (with confirmation)
-  async function handleDeleteStudent(id: string) {
-    if (!confirm('Delete this student? This action cannot be undone.')) return;
-    try {
-      const newStudents = db.students.filter((s) => s.id !== id);
-      const newDb = { ...db, students: newStudents };
-      setDb(newDb);
-      if (selectedStudent && selectedStudent.id === id) setSelectedStudent(null);
-      await saveDB(newDb, passphrase);
-      try { await uploadCurrentEncryptedDB(); } catch (e) { console.warn('Cloud upload after delete failed', e); }
-      alert('Student deleted.');
-    } catch (err) {
-      alert('Failed to delete student: ' + (err instanceof Error ? err.message : String(err)));
-    }
-  }
-
-  // Clear all enrollments (students) with confirmation. Keeps logs intact.
-  async function handleClearAllEnrollments() {
-    if (!confirm('Clear ALL enrollments? This will remove every student record but will keep check-in/out logs. This cannot be undone.')) return;
-    try {
-      const newDb = { ...db, students: [] };
-      setDb(newDb);
-      setSelectedStudent(null);
-      await saveDB(newDb, passphrase);
-      try { await uploadCurrentEncryptedDB(); } catch (e) { console.warn('Cloud upload after clear failed', e); }
-      alert('All enrollments cleared.');
-    } catch (err) {
-      alert('Failed to clear enrollments: ' + (err instanceof Error ? err.message : String(err)));
-    }
-  }
-
-  // Export the encrypted DB blob (as saved in storage) so user can back it up
-  async function exportEncryptedDB() {
-    try {
-      const blob = await idbGet(STORAGE_KEY);
-      if (!blob) return alert('No database found to export.');
-      const data = typeof blob === 'string' ? blob : String(blob);
-      const file = new Blob([data], { type: 'application/json' });
-      const url = URL.createObjectURL(file);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'ttb-encrypted-db.json';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      alert('Exported encrypted DB to downloads.');
-    } catch (err) {
-      alert('Export failed: ' + (err instanceof Error ? err.message : String(err)));
-    }
-  }
-
-  // Import an encrypted DB blob file (will overwrite current stored DB)
-  async function handleImportFile(e) {
-    const f = e.target.files && e.target.files[0];
-    if (!f) return;
-    if (!confirm('Importing will overwrite the local encrypted database. Continue?')) return;
-    try {
-      const txt = await f.text();
-      await idbPut(STORAGE_KEY, txt);
-      alert('Imported encrypted DB. Use your passphrase to unlock.');
-      // clear the file input
-      e.target.value = '';
-    } catch (err) {
-      alert('Import failed: ' + (err instanceof Error ? err.message : String(err)));
-    }
-  }
-
-  // When a photo input changes, compress and store dataURL in the form
-  async function handlePhotoChange(e, key) {
-    const f = e.target.files[0];
-    if (!f) return;
-    if (!f.type.startsWith("image/")) return alert("Please upload an image file.");
-    try {
-      const dataUrl = await fileToDataUrl(f, 900, 0.75);
-      setForm((s) => ({ ...s, photos: { ...s.photos, [key]: dataUrl } }));
-    } catch (err) {
-      alert('Image processing failed: ' + (err.message || err));
-    }
-  }
-
-  function selectStudentById(id: string) {
-    const s = db.students.find((x) => x.id === id);
-    setSelectedStudent(s || null);
-    // reset checkout guardian selection when opening a new record
-    setCheckoutGuardian("");
-  }
-
-  function studentsForClass(cls: string) {
-    if (!cls) return [] as Student[];
-    return db.students.filter((s) => (s.classSection || "") === cls);
-  }
-
-  function handleSelectFromQuery(query: string) {
-    if (!query) return;
-    // If user typed a value like "Name | ID", try match by id first
-  const byIdExact = db.students.find((s) => s.id === query);
-    if (byIdExact) return selectStudentById(byIdExact.id);
-    // Try to parse pattern 'Name | ID'
-    const parts = query.split('|').map(p => p.trim());
-    if (parts.length === 2) {
-      const maybeId = parts[1];
-      const byId = db.students.find((s) => s.id === maybeId);
-      if (byId) return selectStudentById(byId.id);
-    }
-    // Fallback: match by name (exact or contains)
-  const byNameExact = db.students.find((s) => s.name && s.name.toLowerCase() === query.toLowerCase());
-    if (byNameExact) return selectStudentById(byNameExact.id);
-    const byNamePartial = db.students.find((s) => s.name && s.name.toLowerCase().includes(query.toLowerCase()));
-    if (byNamePartial) return selectStudentById(byNamePartial.id);
-    // nothing matched: clear selection
-    setSelectedStudent(null);
-  }
-
-  const ClassDropdown = ({ value, onChange }) => (
-    <select value={value} onChange={(e) => onChange(e.target.value)} required className="w-full p-3 rounded border focus:outline-none">
-      <option>Pravesham</option>
-      <option>Pravalam</option>
-      <option>Pradhanam</option>
-      <option>Pravardham</option>
-      <option>Praaveenyam</option>
-    </select>
-  );
-
-  function StudentCard({ student, onCheckIn, onSelect }: { student: Student; onCheckIn: (s: Student) => void; onSelect: (id: string) => void }) {
-    return (
-      <div className="flex gap-3 items-center p-3 rounded-lg border shadow-sm bg-white">
-          <img src={student.photos?.student || ""} alt="student" className="w-20 h-20 object-cover rounded-md border" />
-        <div className="flex-1">
-          <div className="text-lg font-semibold">{student.name}</div>
-          <div className="text-sm">{student.classSection} • {student.id}</div>
-          <div className="mt-2 flex gap-2">
-            <button onClick={() => onCheckIn(student)} className="flex-1 py-2 rounded-lg text-white font-semibold bg-emerald-600 touch-manipulation">Check In</button>
-            <button onClick={() => onSelect(student.id)} className="py-2 px-3 rounded-lg border">Verify</button>
-          </div>
-        </div>
-      </div>
+  // Filter students by class and query
+  const filterStudents = (students: Student[], classSection: string, query: string) => {
+    const arr = Array.isArray(students) ? students : [];
+    return arr.filter(s => 
+      s.classSection === classSection &&
+      (s.name.toLowerCase().includes(query.toLowerCase()) ||
+       s.id.toLowerCase().includes(query.toLowerCase()))
     );
-  }
+  };
 
-  // Very small nav / unlock screen
-  if (!unlocked) {
-    return (
-      <div className="min-h-screen bg-gradient-to-b from-sky-50 to-white p-4 safe-area-inset">
-        <div className="max-w-xl mx-auto">
-          <h1 className="text-2xl font-bold mb-2">Triangle Telugu Badi — Attendance (iOS)</h1>
-          <p className="mb-4 text-sm">Enter a session passphrase to unlock the encrypted attendance database. This passphrase will be used to encrypt/decrypt the stored records. It is NOT saved.</p>
-          <input type="password" placeholder="Enter passphrase" value={passphrase} onChange={(e) => setPassphrase(e.target.value)} className="w-full p-3 rounded border mb-3" />
-          <div className="flex gap-2">
-            <button onClick={handleUnlock} className="flex-1 py-3 rounded-lg bg-blue-600 text-white font-semibold">Unlock</button>
-            <button onClick={async () => {
-              const v = prompt('Create a passphrase for initial encryption (remember it well):');
-              if (!v) return alert('Passphrase is required to create a new encrypted database.');
-              try {
-                setPassphrase(v);
-                // initialize empty DB and persist it
-                const initial: AppDB = { students: [], logs: [] };
-                await saveDB(initial, v);
-                setDb(initial);
-                setUnlocked(true);
-                alert('New encrypted database created and unlocked. Remember your passphrase to access it later.');
-              } catch (err) {
-                alert('Failed to create initial database: ' + (err instanceof Error ? err.message : String(err)));
-              }
-            }} className="py-3 px-4 rounded-lg border">Create</button>
-          </div>
-          <div className="mt-4 text-xs text-gray-600">
-            <strong>Security note:</strong> If you lose the passphrase, data cannot be recovered. For multi-device use, integrate a secure server-side sync.
-            <br />This version stores data in <strong>IndexedDB</strong> (preferred) and compresses images to reduce storage use.
-          </div>
-          {loading && <div className="mt-3">Loading…</div>}
-        </div>
-      </div>
-    );
-  }
+  // Handle check-in
+  const handleCheckin = (student: Student) => {
+    setCheckedIn(prev => ({ ...prev, [student.id]: true }));
+    setCheckedOut(prev => ({ ...prev, [student.id]: false }));
+    const newLog = {
+      id: `log_${Date.now()}`,
+      type: 'checkin',
+      studentId: student.id,
+      timestamp: new Date().toISOString(),
+    };
+    setDb(prev => ({
+      ...prev,
+      logs: [...prev.logs, newLog]
+    }));
+  };
 
-  // Main unlocked UI
+  // Handle check-out
+  const handleCheckout = (student: Student) => {
+    setCheckedOut(prev => ({ ...prev, [student.id]: true }));
+    setCheckedIn(prev => ({ ...prev, [student.id]: false }));
+    const newLog = {
+      id: `log_${Date.now()}`,
+      type: 'checkout',
+      studentId: student.id,
+      guardian: selectedGuardian[student.id] || '',
+      timestamp: new Date().toISOString(),
+    };
+    setDb(prev => ({
+      ...prev,
+      logs: [...prev.logs, newLog]
+    }));
+  };
+
   return (
-    <div className="min-h-screen bg-gradient-to-b from-sky-50 to-white p-4 safe-area-inset">
-      <div className="max-w-xl mx-auto">
-        <header className="flex items-center justify-between mb-4">
-          <div>
-            <h1 className="text-2xl font-bold">Triangle Telugu Badi</h1>
-            <div className="text-sm text-gray-600">Sunday Attendance — Check-In / Check-Out</div>
-          </div>
-          <div className="flex gap-2">
-            <button onClick={() => setView("checkin")} className={`px-3 py-2 rounded ${view==='checkin'?'bg-blue-600 text-white':'border'}`}>Check In</button>
-            <button onClick={() => setView("checkout")} className={`px-3 py-2 rounded ${view==='checkout'?'bg-blue-600 text-white':'border'}`}>Check Out</button>
-            <button onClick={() => setView("admin")} className={`px-3 py-2 rounded ${view==='admin'?'bg-blue-600 text-white':'border'}`}>Enrollment</button>
-          </div>
-          <div className="flex items-center gap-2 text-sm">
-            <div className="px-3 py-2 rounded border">{syncStatus || 'No cloud'}</div>
-            {lastSyncAt && <div className="text-xs text-gray-500">Last sync: {new Date(lastSyncAt).toLocaleString()}</div>}
-            {authUser ? (
-              <button className="px-3 py-2 rounded border" onClick={async () => {
-                try { const cs = await lazyCloud(); if (cs && cs.signOut) await cs.signOut(); setAuthUser(null); } catch (e) { console.warn(e); }
-              }}>Sign out</button>
-            ) : (
-              <button className="px-3 py-2 rounded border" onClick={async () => {
-                const email = prompt('Email for Firebase sign-in');
-                if (!email) return;
-                const pass = prompt('Password');
-                if (!pass) return;
-                try {
-                  setSyncStatus('Signing in...');
-                  const cs = await lazyCloud();
-                  if (cs && cs.signIn) await cs.signIn(email, pass);
-                  setSyncStatus('Signed in');
-                } catch (e) { alert('Sign-in failed: ' + (e as any).message || e); setSyncStatus('Sign-in failed'); }
-              }}>Sign in</button>
-            )}
+    <div className="min-h-screen bg-gradient-to-b from-sky-50 to-white p-4">
+      <div className="max-w-4xl mx-auto">
+        <header className="mb-8">
+          <h1 className="text-2xl font-bold">TATA తెలుగు బడి</h1>
+          <div className="mt-4 flex gap-4">
+            <button 
+              onClick={() => setView("checkin")}
+              className={`px-4 py-2 rounded ${view === "checkin" ? "bg-blue-500 text-white" : "bg-gray-100"}`}
+            >
+              Check In
+            </button>
+            <button 
+              onClick={() => setView("checkout")}
+              className={`px-4 py-2 rounded ${view === "checkout" ? "bg-blue-500 text-white" : "bg-gray-100"}`}
+            >
+              Check Out
+            </button>
+            <button 
+              onClick={() => setView("admin")}
+              className={`px-4 py-2 rounded ${view === "admin" ? "bg-blue-500 text-white" : "bg-gray-100"}`}
+            >
+              Admin
+            </button>
           </div>
         </header>
 
-        {view === "admin" && (
-          <main className="space-y-4">
-            <form onSubmit={handleAddStudent} className="space-y-3 bg-white p-4 rounded-lg shadow-sm">
-              <h2 className="text-lg font-semibold">Enroll New Student</h2>
-              <label className="block text-sm">Student Name <input required className="w-full p-3 rounded border mt-1" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
-              <label className="block text-sm">Class Section <div className="mt-1"><ClassDropdown value={form.classSection} onChange={(v) => setForm({ ...form, classSection: v })} /></div></label>
-              
-              <div className="grid grid-cols-2 gap-2">
-                <label className="block text-sm">Date of Birth 
-                  <input 
-                    type="date" 
-                    required 
-                    className="w-full p-3 rounded border mt-1" 
-                    value={form.dateOfBirth} 
-                    onChange={(e) => setForm({ ...form, dateOfBirth: e.target.value })} 
-                  />
-                </label>
-                <label className="block text-sm">Age 
-                  <input 
-                    type="text" 
-                    readOnly 
-                    className="w-full p-3 rounded border mt-1 bg-gray-100" 
-                    value={form.dateOfBirth ? `${calculateAge(form.dateOfBirth)} years` : ""} 
-                    placeholder="Auto-calculated"
-                  />
-                </label>
+        <main>
+          {/* Admin Page: Tabs for Enroll and Check on Student */}
+          {view === "admin" && (
+            <div>
+              <div className="flex gap-2 mb-6">
+                <button
+                  className={`px-4 py-2 rounded-t ${adminTab === "enroll" ? "bg-blue-500 text-white" : "bg-gray-100"}`}
+                  onClick={() => setAdminTab("enroll")}
+                >
+                  Enroll New Student
+                </button>
+                <button
+                  className={`px-4 py-2 rounded-t ${adminTab === "updatestudent" ? "bg-blue-500 text-white" : "bg-gray-100"}`}
+                  onClick={() => setAdminTab("updatestudent")}
+                >
+                  Update Student
+                </button>
+                <button
+                  className={`px-4 py-2 rounded-t ${adminTab === "checkstudent" ? "bg-blue-500 text-white" : "bg-gray-100"}`}
+                  onClick={() => setAdminTab("checkstudent")}
+                >
+                  Check on Student
+                </button>
               </div>
-              <label className="block text-sm">Father's Name <input className="w-full p-3 rounded border mt-1" value={form.fatherName} onChange={(e) => setForm({ ...form, fatherName: e.target.value })} /></label>
-              <label className="block text-sm">Mother's Name <input className="w-full p-3 rounded border mt-1" value={form.motherName} onChange={(e) => setForm({ ...form, motherName: e.target.value })} /></label>
-              <label className="block text-sm">Guardian-1 Name <input className="w-full p-3 rounded border mt-1" value={form.guardian1Name} onChange={(e) => setForm({ ...form, guardian1Name: e.target.value })} /></label>
-              <label className="block text-sm">Guardian-2 Name <input className="w-full p-3 rounded border mt-1" value={form.guardian2Name} onChange={(e) => setForm({ ...form, guardian2Name: e.target.value })} /></label>
-              <label className="block text-sm">Contact <input className="w-full p-3 rounded border mt-1" value={form.contact} onChange={(e) => setForm({ ...form, contact: e.target.value })} /></label>
-              <label className="block text-sm">Email <input type="email" className="w-full p-3 rounded border mt-1" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></label>
-              <label className="block text-sm">Address <textarea className="w-full p-3 rounded border mt-1" value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })}></textarea></label>
-              
-              <div className="space-y-2">
-                <div className="text-sm font-semibold">Upload Passport Photos (recommended)</div>
-                <div className="grid grid-cols-2 gap-2">
-                  <label className="block text-xs text-center py-2 border rounded">
-                    Student Photo
-                    <input accept="image/*" onChange={(e) => handlePhotoChange(e, "student")} className="mt-2 block w-full" type="file" />
-                    {form.photos.student && <img src={form.photos.student} alt="stu" className="mx-auto mt-2 w-24 h-24 object-cover rounded" />}
-                  </label>
-                  <label className="block text-xs text-center py-2 border rounded">
-                    Father's Photo
-                    <input accept="image/*" onChange={(e) => handlePhotoChange(e, "father")} className="mt-2 block w-full" type="file" />
-                    {form.photos.father && <img src={form.photos.father} alt="father" className="mx-auto mt-2 w-24 h-24 object-cover rounded" />}
-                  </label>
-                  <label className="block text-xs text-center py-2 border rounded">
-                    Mother's Photo
-                    <input accept="image/*" onChange={(e) => handlePhotoChange(e, "mother")} className="mt-2 block w-full" type="file" />
-                    {form.photos.mother && <img src={form.photos.mother} alt="mother" className="mx-auto mt-2 w-24 h-24 object-cover rounded" />}
-                  </label>
-                  <label className="block text-xs text-center py-2 border rounded">
-                    Guardian-1 Photo
-                    <input accept="image/*" onChange={(e) => handlePhotoChange(e, "guardian1")} className="mt-2 block w-full" type="file" />
-                    {form.photos.guardian1 && <img src={form.photos.guardian1} alt="g1" className="mx-auto mt-2 w-24 h-24 object-cover rounded" />}
-                  </label>
-                  <label className="block text-xs text-center py-2 border rounded col-span-2">
-                    Guardian-2 Photo
-                    <input accept="image/*" onChange={(e) => handlePhotoChange(e, "guardian2")} className="mt-2 block w-full" type="file" />
-                    {form.photos.guardian2 && <img src={form.photos.guardian2} alt="g2" className="mx-auto mt-2 w-24 h-24 object-cover rounded" />}
-                  </label>
-                </div>
-                <div className="text-xs text-gray-500">Photos are automatically resized & compressed to reduce storage use.</div>
-              </div>
-
-              <div className="flex gap-2">
-                <button type="submit" className="flex-1 py-3 rounded-lg bg-emerald-600 text-white font-semibold">Save Student</button>
-                <button type="button" onClick={() => setForm(emptyForm)} className="py-3 px-4 rounded-lg border">Reset</button>
-              </div>
-            </form>
-
-          <section className="bg-white p-3 rounded shadow-sm">
-            <div className="flex items-center justify-between">
-              <h3 className="font-semibold">Enrolled Students</h3>
-              <div>
-                  <button onClick={handleClearAllEnrollments} disabled={db.students.length===0} className="px-3 py-1 rounded border text-sm">Clear All Enrollments</button>
-                  <button onClick={exportEncryptedDB} className="ml-2 px-3 py-1 rounded border text-sm">Export DB</button>
-                  <label className="ml-2 px-3 py-1 rounded border text-sm cursor-pointer">
-                    Import
-                    <input type="file" accept=".json" onChange={(e) => handleImportFile(e)} className="hidden" />
-                  </label>
-              </div>
-            </div>
-            <div className="mt-2 space-y-2">
-              {db.students.length === 0 && <div className="text-sm text-gray-500">No students yet.</div>}
-              {db.students.map((s) => (
-                <div key={s.id} className="flex items-center gap-3 p-2 border rounded">
-                  <img src={s.photos.student || ""} alt="stu" className="w-12 h-12 object-cover rounded" />
-                  <div className="flex-1">
-                    <div className="font-medium">{s.name}</div>
-                    <div className="text-xs text-gray-600">
-                      {s.classSection} • {s.id}
-                      {s.dateOfBirth && ` • Age: ${calculateAge(s.dateOfBirth)}`}
+              {adminTab === "updatestudent" && (
+                <UpdateStudentPage db={db} setDb={setDb} classOptions={classOptions} />
+              )}
+              {adminTab === "enroll" && (
+                <div className="mb-8">
+                  {/* Only the enrollment form, no extra headings. */}
+                  <form
+                    onSubmit={e => {
+                      e.preventDefault();
+                      setEnrollError("");
+                      setEnrollSuccess(false);
+                      if (!enrollForm.studentFullName.trim()) {
+                        setEnrollError("Student Full Name is required");
+                        return;
+                      }
+                      // Composite primary key: UPPER(name), dob, UPPER(contact)
+                      const exists = db.students.some(s =>
+                        (s.name?.trim().toUpperCase() === enrollForm.studentFullName.trim().toUpperCase()) &&
+                        (s.dateOfBirth === enrollForm.dateOfBirth) &&
+                        (s.contact?.trim().toUpperCase() === enrollForm.contact.trim().toUpperCase())
+                      );
+                      if (exists) {
+                        setEnrollError("Duplicate record: A student with the same name, date of birth, and contact number already exists.");
+                        return;
+                      }
+                      // Generate a simple unique ID
+                      const id = `TATB-${Date.now()}`;
+                      setDb(prev => ({
+                        ...prev,
+                        students: [
+                          ...prev.students,
+                          {
+                            id,
+                            name: enrollForm.studentFullName,
+                            classSection: enrollForm.classSection,
+                            dateOfBirth: enrollForm.dateOfBirth,
+                            fatherName: enrollForm.fatherFullName,
+                            motherName: enrollForm.motherFullName,
+                            guardian1Name: enrollForm.guardianName,
+                            contact: enrollForm.contact,
+                            altContact: enrollForm.altContact,
+                            email: enrollForm.email,
+                            address: enrollForm.address,
+                          },
+                        ],
+                      }));
+                      setEnrollForm({
+                        studentFullName: "",
+                        classSection: "Pravesham",
+                        dateOfBirth: "",
+                        fatherFullName: "",
+                        motherFullName: "",
+                        guardianName: "",
+                        contact: "",
+                        altContact: "",
+                        email: "",
+                        address: "",
+                      });
+                      setEnrollSuccess(true);
+                    }}
+                    className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 border rounded bg-white"
+                  >
+                    <input
+                      className="p-2 border rounded"
+                      placeholder="Student Full Name"
+                      value={enrollForm.studentFullName}
+                      onChange={e => setEnrollForm(f => ({ ...f, studentFullName: e.target.value }))}
+                    />
+                    <select
+                      className="p-2 border rounded"
+                      value={enrollForm.classSection}
+                      onChange={e => setEnrollForm(f => ({ ...f, classSection: e.target.value }))}
+                    >
+                      {classOptions.map(opt => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                    </select>
+                    <div className="flex gap-2 items-center">
+                      <input
+                        className="p-2 border rounded w-full"
+                        type="date"
+                        placeholder="Date of Birth"
+                        value={enrollForm.dateOfBirth}
+                        onChange={e => setEnrollForm(f => ({ ...f, dateOfBirth: e.target.value }))}
+                      />
+                      <span className="ml-2">Age: {enrollForm.dateOfBirth ? calculateAge(enrollForm.dateOfBirth) : "-"}</span>
                     </div>
-                  </div>
-                  <div className="flex gap-2">
-                    <button onClick={() => { navigator.clipboard?.writeText(s.id); alert('Student ID copied'); }} className="px-3 py-1 rounded border">Copy ID</button>
-                    <button onClick={() => handleDeleteStudent(s.id)} className="px-3 py-1 rounded border text-red-600">Delete</button>
+                    <input
+                      className="p-2 border rounded"
+                      placeholder="Father Full Name"
+                      value={enrollForm.fatherFullName}
+                      onChange={e => setEnrollForm(f => ({ ...f, fatherFullName: e.target.value }))}
+                    />
+                    <input
+                      className="p-2 border rounded"
+                      placeholder="Mother Full Name"
+                      value={enrollForm.motherFullName}
+                      onChange={e => setEnrollForm(f => ({ ...f, motherFullName: e.target.value }))}
+                    />
+                    <input
+                      className="p-2 border rounded"
+                      placeholder="Guardian Name"
+                      value={enrollForm.guardianName}
+                      onChange={e => setEnrollForm(f => ({ ...f, guardianName: e.target.value }))}
+                    />
+                    <input
+                      className="p-2 border rounded"
+                      placeholder="Contact Number"
+                      value={enrollForm.contact}
+                      onChange={e => setEnrollForm(f => ({ ...f, contact: e.target.value }))}
+                    />
+                    <input
+                      className="p-2 border rounded"
+                      placeholder="Alternate Contact Number"
+                      value={enrollForm.altContact}
+                      onChange={e => setEnrollForm(f => ({ ...f, altContact: e.target.value }))}
+                    />
+                    <input
+                      className="p-2 border rounded"
+                      placeholder="Email Address"
+                      value={enrollForm.email}
+                      onChange={e => setEnrollForm(f => ({ ...f, email: e.target.value }))}
+                    />
+                    <input
+                      className="p-2 border rounded md:col-span-2"
+                      placeholder="Address"
+                      value={enrollForm.address}
+                      onChange={e => setEnrollForm(f => ({ ...f, address: e.target.value }))}
+                    />
+                    <button
+                      type="submit"
+                      className="p-2 bg-blue-600 text-white rounded md:col-span-2"
+                    >
+                      Enroll Student
+                    </button>
+                    {enrollError && <div className="text-red-600 md:col-span-2">{enrollError}</div>}
+                    {enrollSuccess && <div className="text-green-600 md:col-span-2">Enrollment successful</div>}
+                  </form>
+
+                  {/* Bulk Enrollment Section */}
+                  <div className="mt-8 p-4 border rounded bg-gray-50">
+                    <h3 className="font-semibold mb-2">Bulk Enrollment of Students</h3>
+                    <input
+                      type="file"
+                      accept=".csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel"
+                      onChange={handleBulkFileChange}
+                      className="mb-2"
+                    />
+                    <button
+                      className="px-4 py-2 bg-blue-600 text-white rounded"
+                      onClick={handleBulkUpload}
+                      disabled={!bulkFile}
+                    >
+                      Upload
+                    </button>
+                    {bulkUploadMessage && <div className="mt-2 text-green-700">{bulkUploadMessage}</div>}
+                    {bulkUploadError && <div className="mt-2 text-red-600">{bulkUploadError}</div>}
                   </div>
                 </div>
-              ))}
+              )}
+              {adminTab === "checkstudent" && (
+                <CheckStudentPage db={db} logs={db.logs} />
+              )}
             </div>
-          </section>
-        </main>
-      )}
-
-      {view === "checkin" && (
-        <main className="space-y-4">
-          <div className="bg-white p-3 rounded shadow-sm">
-            <label className="block text-sm">Select Class</label>
-            <select value={checkinClass} onChange={(e) => { setCheckinClass(e.target.value); setCheckinQuery(''); setSelectedStudent(null); }} className="w-full p-3 rounded border mt-2">
-              {classOptions.map((c) => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-
-            <label className="block text-sm mt-3">Student (type name or pick)</label>
-            <input
-              list="checkin-students"
-              value={checkinQuery}
-              onChange={(e) => {
-                const v = e.target.value;
-                setCheckinQuery(v);
-                // if the value exactly matches an option, select immediately
-                const match = studentsForClass(checkinClass).find(s => `${s.name} | ${s.id}` === v || s.id === v || s.name === v);
-                if (match) handleSelectFromQuery(v);
-              }}
-              onBlur={() => handleSelectFromQuery(checkinQuery)}
-              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleSelectFromQuery(checkinQuery); } }}
-              placeholder="Type name or select a student"
-              className="w-full p-3 rounded border mt-2"
-            />
-            <datalist id="checkin-students">
-              {studentsForClass(checkinClass).map((s) => (
-                <option key={s.id} value={`${s.name} | ${s.id}`} />
-              ))}
-            </datalist>
-          </div>
-
-          <div className="space-y-2">
-              {findMatches(searchTerm).slice(0, 50).map((s) => (
-                <StudentCard key={s.id} student={s} onCheckIn={handleCheckIn} onSelect={(id: string) => selectStudentById(id)} />
-              ))}
-            {findMatches(searchTerm).length === 0 && <div className="text-sm text-gray-500">No matches.</div>}
-          </div>
-
-          {selectedStudent && (
-            <section className="bg-white p-3 rounded shadow-sm">
-              <div className="flex gap-3 items-center">
-                  <img src={selectedStudent?.photos?.student || ""} alt="stu" className="w-28 h-28 object-cover rounded border" />
-                <div>
-                  <div className="text-lg font-semibold">{selectedStudent.name}</div>
-                  <div className="text-sm text-gray-600">{selectedStudent.classSection} • {selectedStudent.id}</div>
-                  <div className="mt-2">
-                    <button onClick={() => handleCheckIn(selectedStudent)} className="py-3 px-6 rounded-lg bg-emerald-600 text-white font-semibold">Confirm Check In</button>
-                  </div>
-                </div>
-              </div>
-            </section>
           )}
-        </main>
-      )}
-
-      {view === "checkout" && (
-        <main className="space-y-4">
-          <div className="bg-white p-3 rounded shadow-sm">
-            <label className="block text-sm">Select Class</label>
-            <select value={checkoutClass} onChange={(e) => { setCheckoutClassState(e.target.value); setCheckoutQuery(''); setSelectedStudent(null); }} className="w-full p-3 rounded border mt-2">
-              {classOptions.map((c) => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-
-            <label className="block text-sm mt-3">Student (type name or pick)</label>
-            <input
-              list="checkout-students"
-              value={checkoutQuery}
-              onChange={(e) => {
-                const v = e.target.value;
-                setCheckoutQuery(v);
-                const match = studentsForClass(checkoutClass).find(s => `${s.name} | ${s.id}` === v || s.id === v || s.name === v);
-                if (match) handleSelectFromQuery(v);
-              }}
-              onBlur={() => handleSelectFromQuery(checkoutQuery)}
-              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleSelectFromQuery(checkoutQuery); } }}
-              placeholder="Type name or select a student"
-              className="w-full p-3 rounded border mt-2"
-            />
-            <datalist id="checkout-students">
-              {studentsForClass(checkoutClass).map((s) => (
-                <option key={s.id} value={`${s.name} | ${s.id}`} />
-              ))}
-            </datalist>
-          </div>
-
-          <div className="space-y-2">
-            {findMatches(searchTerm).slice(0, 50).map((s) => (
-              <div key={s.id} className="p-2 bg-white rounded border flex items-center gap-3">
-                <img src={s.photos?.student || ""} alt="stu" className="w-16 h-16 object-cover rounded" />
-                <div className="flex-1">
-                  <div className="font-medium">{s.name}</div>
-                  <div className="text-xs text-gray-600">{s.classSection} • {s.id}</div>
-                </div>
-                <button onClick={() => selectStudentById(s.id)} className="px-3 py-2 rounded border">Open</button>
+          {view === "checkin" && (
+            <div>
+              <h2 className="text-xl font-semibold mb-4">Check In</h2>
+              <div className="mb-4">
+                <select 
+                  value={checkinClass}
+                  onChange={(e) => setCheckinClass(e.target.value)}
+                  className="mr-4 p-2 border rounded"
+                >
+                  {classOptions.map(opt => (
+                    <option key={opt} value={opt}>{opt}</option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  value={checkinQuery}
+                  onChange={e => setCheckinQuery(e.target.value)}
+                  placeholder="Search by name or ID..."
+                  className="p-2 border rounded w-64"
+                />
               </div>
-            ))}
-          </div>
-
-          {selectedStudent && (
-            <section className="bg-white p-3 rounded shadow-sm">
-              <div className="text-lg font-semibold mb-2">Verify & Check Out</div>
-              <div className="grid grid-cols-1 gap-3">
-                <div className="flex gap-3 items-center">
-                  <div className="text-xs text-gray-600">Student</div>
-                  <img src={selectedStudent?.photos?.student || ""} alt="stu" className="w-24 h-24 object-cover rounded border" />
-                  <div className="ml-3">
-                    <div className="font-medium">{selectedStudent.name}</div>
-                    <div className="text-sm text-gray-500">{selectedStudent.classSection}</div>
-                  </div>
-                </div>
-
-                <div className="text-sm font-semibold">Authorized Collectors (photos shown simultaneously)</div>
-                <div className="grid grid-cols-2 gap-2">
-                  <label className="p-2 border rounded flex items-center gap-2">
-                    <input type="radio" name="collector" onChange={() => setCheckoutGuardian('father')} />
-                    <img src={selectedStudent?.photos?.father || ''} alt="father" className="w-16 h-16 object-cover rounded" />
-                    <div>
-                      <div className="font-medium">{selectedStudent.fatherName || 'Father'}</div>
-                      <div className="text-xs text-gray-500">{selectedStudent.contact}</div>
-                    </div>
-                  </label>
-                  <label className="p-2 border rounded flex items-center gap-2">
-                    <input type="radio" name="collector" onChange={() => setCheckoutGuardian('mother')} />
-                    <img src={selectedStudent?.photos?.mother || ''} alt="mother" className="w-16 h-16 object-cover rounded" />
-                    <div>
-                      <div className="font-medium">{selectedStudent.motherName || 'Mother'}</div>
-                      <div className="text-xs text-gray-500">{selectedStudent.contact}</div>
-                    </div>
-                  </label>
-                  <label className="p-2 border rounded flex items-center gap-2">
-                    <input type="radio" name="collector" onChange={() => setCheckoutGuardian('guardian1')} />
-                    <img src={selectedStudent?.photos?.guardian1 || ''} alt="g1" className="w-16 h-16 object-cover rounded" />
-                    <div>
-                      <div className="font-medium">{selectedStudent.guardian1Name || 'Guardian 1'}</div>
-                      <div className="text-xs text-gray-500">{selectedStudent.contact}</div>
-                    </div>
-                  </label>
-                  <label className="p-2 border rounded flex items-center gap-2">
-                    <input type="radio" name="collector" onChange={() => setCheckoutGuardian('guardian2')} />
-                    <img src={selectedStudent?.photos?.guardian2 || ''} alt="g2" className="w-16 h-16 object-cover rounded" />
-                    <div>
-                      <div className="font-medium">{selectedStudent.guardian2Name || 'Guardian 2'}</div>
-                      <div className="text-xs text-gray-500">{selectedStudent.contact}</div>
-                    </div>
-                  </label>
-                </div>
-
-                <div className="mt-3">
-                  <button onClick={() => handleCheckOut(selectedStudent, checkoutGuardian)} className="w-full py-3 rounded-lg bg-red-600 text-white font-semibold">Confirm Check Out</button>
-                </div>
+              <div className="flex flex-col gap-4 pb-2">
+                {(() => {
+                  const studentsArr = Array.isArray(db.students) ? db.students : [];
+                  const students = filterStudents(studentsArr, checkinClass, checkinQuery);
+                  // Move checked-in students to the end
+                  const notCheckedIn = students.filter(s => !checkedIn[s.id]);
+                  const checkedInList = students.filter(s => checkedIn[s.id]);
+                  const ordered = [...notCheckedIn, ...checkedInList];
+                  return ordered.map(student => {
+                    const isCheckedIn = checkedIn[student.id];
+                    return (
+                      <div key={student.id} className="w-full max-w-2xl p-4 border rounded bg-white shadow">
+                        <div className="font-semibold">{student.name}</div>
+                        <div className="text-sm text-gray-500 mb-2">
+                          ID: {student.id} | Class: {student.classSection}
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => !isCheckedIn && handleCheckin(student)}
+                            className={`flex-1 px-4 py-2 rounded text-white ${isCheckedIn ? 'bg-green-600' : 'bg-orange-500'}`}
+                            disabled={isCheckedIn}
+                          >
+                            {isCheckedIn ? 'Checked In' : 'Check In'}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  });
+                })()}
               </div>
-            </section>
-          )}
-
-          <section className="bg-white p-3 rounded shadow-sm">
-            <h3 className="font-semibold">Recent Logs</h3>
-            <div className="mt-2 space-y-2 text-sm">
-              {db.logs.slice(0, 20).map((l) => (
-                <div key={l.id} className="flex justify-between">
-                  <div>{l.studentName} — {l.type === 'checkin' ? 'In' : 'Out'} • {humanTime(l.timestamp)}</div>
-                  <div className="text-gray-500">{l.collectedBy || ''}</div>
-                </div>
-              ))}
-              {db.logs.length === 0 && <div className="text-gray-500">No logs yet.</div>}
             </div>
-          </section>
+          )}
+          {view === "checkout" && (
+            <div>
+              <h2 className="text-xl font-semibold mb-4">Check Out</h2>
+              <div className="mb-4">
+                <select 
+                  value={checkoutClass}
+                  onChange={(e) => setCheckoutClassState(e.target.value)}
+                  className="mr-4 p-2 border rounded"
+                >
+                  {classOptions.map(opt => (
+                    <option key={opt} value={opt}>{opt}</option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  value={checkoutQuery}
+                  onChange={e => setCheckoutQuery(e.target.value)}
+                  placeholder="Search by name or ID..."
+                  className="p-2 border rounded w-64"
+                />
+              </div>
+              <div className="flex flex-col gap-4 pb-2">
+                {(Array.isArray(db.students) ? filterStudents(db.students, checkoutClass, checkoutQuery) : [])
+                  .filter(student => checkedIn[student.id])
+                  .map(student => {
+                    const isCheckedOut = checkoutStatus[student.id];
+                    const guardianOptions = [];
+                    if (student.fatherName) guardianOptions.push({ label: student.fatherName, value: student.fatherName });
+                    if (student.motherName) guardianOptions.push({ label: student.motherName, value: student.motherName });
+                    if (student.guardian1Name) guardianOptions.push({ label: student.guardian1Name, value: student.guardian1Name });
+                    const selected = selectedGuardian[student.id] || (guardianOptions[0]?.value || '');
+                    return (
+                      <div key={student.id} className="w-full max-w-2xl p-4 border rounded bg-white shadow">
+                        <div className="font-semibold">{student.name}</div>
+                        <div className="text-sm text-gray-500 mb-2">
+                          ID: {student.id} | Class: {student.classSection}
+                        </div>
+                        <div className="mb-2 flex gap-4 items-center">
+                          {guardianOptions.map(opt => (
+                            <label key={opt.label} className="flex items-center gap-1">
+                              <input
+                                type="radio"
+                                name={`guardian-${student.id}`}
+                                value={opt.value}
+                                checked={selected === opt.value}
+                                onChange={() => setSelectedGuardian(g => ({ ...g, [student.id]: opt.value }))}
+                                disabled={isCheckedOut}
+                              />
+                              <span>{opt.label}</span>
+                            </label>
+                          ))}
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => {
+                              if (!isCheckedOut) {
+                                handleCheckout(student);
+                                setCheckoutStatus(s => ({ ...s, [student.id]: true }));
+                                setCheckoutMessage(`Student ${student.name} checked out successfully.`);
+                                setTimeout(() => setCheckoutMessage(""), 5000);
+                              }
+                            }}
+                            className={`flex-1 px-4 py-2 rounded text-white ${isCheckedOut ? 'bg-green-600' : 'bg-red-600'}`}
+                            disabled={isCheckedOut}
+                          >
+                            {isCheckedOut ? 'Checked Out' : 'Check Out'}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+              {checkoutMessage && (
+                <div className="mt-4 text-green-700 font-semibold text-center">{checkoutMessage}</div>
+              )}
+              </div>
+            </div>
+          )}
+          {/* ...other views and UI... */}
         </main>
-      )}
-
-      <footer className="mt-6 text-xs text-gray-500 text-center">
-        Built for iPhone & iPad — large tap targets, high contrast, thumb-friendly layout. Data encrypted locally per session (now stored in IndexedDB).
-      </footer>
+      </div>
     </div>
-  </div>
   );
 }

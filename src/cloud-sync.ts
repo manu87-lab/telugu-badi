@@ -18,10 +18,23 @@ async function tryInitDb() {
     const cfgModule = await import('./cloud-config');
     const cfg = cfgModule?.FIREBASE_CONFIG;
     if (cfg && Object.keys(cfg).length) {
-      if (!getApps().length) initializeApp(cfg);
+      if (!getApps().length) {
+        console.log('Initializing Firebase app...');
+        initializeApp(cfg);
+      }
+      console.log('Getting Firestore instance...');
       dbClient = getFirestore();
-      try { authClient = getAuth(); } catch (e) { authClient = null; }
+      try {
+        console.log('Getting Auth instance...');
+        authClient = getAuth();
+        if (!authClient) throw new Error('Auth client initialization failed');
+      } catch (e) {
+        console.error('Auth initialization error:', e);
+        authClient = null;
+      }
       return dbClient;
+    } else {
+      throw new Error('Invalid Firebase configuration');
     }
   } catch (e) {
     // missing config or failed to import
@@ -42,12 +55,18 @@ async function passphraseKey(passphrase: string) {
 
 export async function signIn(email: string, password: string) {
   try {
-    await tryInitDb();
-    if (!authClient) throw new Error('Auth not initialized');
+    const db = await tryInitDb();
+    console.log('DB initialization status:', !!db);
+    if (!authClient) {
+      console.error('Auth client not initialized');
+      throw new Error('Auth not initialized');
+    }
+    console.log('Attempting sign in for:', email);
     const res = await signInWithEmailAndPassword(authClient, email, password);
+    console.log('Sign in successful');
     return res.user;
-  } catch (e) {
-    console.warn('Sign-in failed', e);
+  } catch (e: any) {
+    console.error('Sign-in failed:', e?.code, e?.message);
     throw e;
   }
 }
@@ -68,20 +87,20 @@ export function onAuthChanged(cb: (uid: string | null) => void) {
   } catch (e) { /* ignore */ }
 }
 
-async function userPathDoc(db: any, uid: string, key: string) {
-  // users/{uid}/ttb_sync/{key}
-  return doc(db, 'users', uid, 'ttb_sync', key);
+
+function userPathDoc(db: any, uid: string) {
+  // users/{uid}/ttb_sync/main
+  return doc(db, 'users', uid, 'ttb_sync', 'main');
 }
 
-export async function fetchEncryptedBlob(passphrase: string) {
+export async function fetchEncryptedBlob() {
   try {
     const db = await tryInitDb();
     if (!db || !authClient) return null;
     const user = authClient.currentUser;
     if (!user) return null;
     const uid = user.uid;
-    const key = await passphraseKey(passphrase);
-    const ref = await userPathDoc(db, uid, key);
+    const ref = userPathDoc(db, uid);
     const snap = await getDoc(ref);
     if (!snap.exists()) return null;
     const data = snap.data();
@@ -92,15 +111,14 @@ export async function fetchEncryptedBlob(passphrase: string) {
   }
 }
 
-export async function uploadEncryptedBlob(passphrase: string, encryptedJson: string) {
+export async function uploadEncryptedBlob(encryptedJson: string) {
   try {
     const db = await tryInitDb();
     if (!db || !authClient) return false;
     const user = authClient.currentUser;
     if (!user) return false; // require signed-in user
     const uid = user.uid;
-    const key = await passphraseKey(passphrase);
-    const ref = await userPathDoc(db, uid, key);
+    const ref = userPathDoc(db, uid);
     await setDoc(ref, { blob: String(encryptedJson), updatedAt: serverTimestamp() });
     return true;
   } catch (e) {
