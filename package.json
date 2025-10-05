@@ -8,8 +8,7 @@
     "build": "vite build",
     "lint": "echo 'Skipping lint for now'",
     "preview": "vite preview",
-    "make-ppt": "node ./scripts/make-ppt.cjs",
-    "postinstall": "node ./scripts/install-rollup-native.cjs"
+  "make-ppt": "node ./scripts/make-ppt.cjs"
   },
   "dependencies": {
     "firebase": "^9.22.0",
@@ -20,7 +19,6 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",
-    "@rollup/rollup-win32-x64-msvc": "^4.52.3",
     "@types/papaparse": "^5.3.16",
     "@types/react": "^19.1.13",
     "@types/react-dom": "^19.1.9",
