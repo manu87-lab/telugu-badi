@@ -446,7 +446,7 @@ export default function App() {
     // eslint-disable-next-line
   }, [db]);
 
-  // Filter students by class and query
+  // Filter students by class and query1
   const filterStudents = (students: Student[], classSection: string, query: string) => {
     const arr = Array.isArray(students) ? students : [];
     return arr.filter(s => 
